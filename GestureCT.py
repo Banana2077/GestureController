@@ -1,290 +1,249 @@
 import cv2
 import mediapipe as mp
-import numpy as np
 import socket
+import math
 
-# ---------------- UDP ----------------
+# =========================
+# UDP SETUP
+# =========================
 
-UDP_IP = "127.0.0.1"
-UDP_PORT = 5052
+HOST = "127.0.0.1"
+PORT = 5055
+
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-# ---------------- MEDIAPIPE ----------------
+# =========================
+# MEDIAPIPE SETUP
+# =========================
 
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    max_num_hands=2,
-    min_detection_confidence=0.75,
-    min_tracking_confidence=0.75
-)
-
 mp_draw = mp.solutions.drawing_utils
 
-# ---------------- CAMERA ----------------
+hands = mp_hands.Hands(
+    max_num_hands=2,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+
+# =========================
+# CAMERA
+# =========================
 
 cap = cv2.VideoCapture(0)
 
-# ---------------- JOYSTICK ----------------
+# =========================
+# JOYSTICK SETTINGS
+# =========================
 
-left_joystick_center = None
-JOYSTICK_RADIUS = 220
-DEADZONE = 55
+JOYSTICK_RADIUS = 200
+DEADZONE = 40
 
-# ---------------- ACTION ----------------
+joystick_center = None
+joystick_active = False
 
-left_action = "IDLE"
-right_action = "NONE"
+# =========================
+# STATE VALUES
+# =========================
 
-# ---------------- DETECT FLAG ----------------
+left_state = "IDLE"
+right_state = "NONE"
 
-hand_detected_left = False
-hand_detected_right = False
+# =========================
+# HELPER FUNCTIONS
+# =========================
 
-# ---------------- STABILITY ----------------
-
-last_action = ""
-action_frames = 0
-ACTION_HOLD = 4
-
-# ---------------- HAND STATE ----------------
-
-hand_state = {
-    "Left": {"cx": None, "cy": None, "radius": 60},
-    "Right": {"cx": None, "cy": None, "radius": 60}
-}
-
-# ---------------- FUNCTIONS ----------------
-
-def smooth_value(old, new, alpha=0.45):
-    return int(old * alpha + new * (1 - alpha))
+def distance(p1, p2):
+    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
 
-def smooth_radius(old, new):
-    return int(old * 0.2 + new * 0.8)
+def send_udp():
+
+    message = f"L:{left_state}\nR:{right_state}"
+
+    sock.sendto(message.encode(), (HOST, PORT))
+
+    print(message)
+    print("-----")
 
 
-def get_palm_center(hand_landmarks, w, h):
+def finger_states(hand_landmarks, palm_center, radius):
 
-    ids = [0,1,5,9,13,17]
-
-    xs = [hand_landmarks.landmark[i].x for i in ids]
-    ys = [hand_landmarks.landmark[i].y for i in ids]
-
-    cx = int(np.mean(xs) * w)
-    cy = int(np.mean(ys) * h)
-
-    return cx, cy
-
-
-def get_dynamic_radius(hand_landmarks, w, h):
-
-    index_base = hand_landmarks.landmark[5]
-    pinky_base = hand_landmarks.landmark[17]
-
-    ix, iy = int(index_base.x*w), int(index_base.y*h)
-    px, py = int(pinky_base.x*w), int(pinky_base.y*h)
-
-    palm_width = np.sqrt((ix-px)**2 + (iy-py)**2)
-
-    return int(palm_width * 1.3)
-
-
-def finger_state(hand_landmarks, center, radius, w, h):
-
-    fingertip_ids = [4,8,12,16,20]
-
-    cx, cy = center
     states = []
 
-    for tip in fingertip_ids:
+    finger_ids = [4,8,12,16,20]
 
-        x = int(hand_landmarks.landmark[tip].x*w)
-        y = int(hand_landmarks.landmark[tip].y*h)
+    for i in finger_ids:
 
-        dist = np.sqrt((x-cx)**2 + (y-cy)**2)
+        tip = hand_landmarks.landmark[i]
 
-        states.append(0 if dist < radius else 1)
+        x = int(tip.x * width)
+        y = int(tip.y * height)
+
+        d = distance((x,y), palm_center)
+
+        if d < radius:
+            states.append(0)
+        else:
+            states.append(1)
 
     return states
 
 
-def stable_action(action):
-
-    global last_action, action_frames
-
-    if action == last_action:
-        action_frames += 1
-    else:
-        last_action = action
-        action_frames = 0
-
-    if action_frames > ACTION_HOLD:
-        return action
-
-    return None
-
-
-# ---------------- MAIN LOOP ----------------
+# =========================
+# MAIN LOOP
+# =========================
 
 while True:
 
-    ret, frame = cap.read()
+    success, frame = cap.read()
+
+    if not success:
+        break
+
     frame = cv2.flip(frame,1)
 
-    h, w, _ = frame.shape
+    height, width, _ = frame.shape
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb)
 
-    hand_detected_left = False
-    hand_detected_right = False
+    results = hands.process(rgb)
 
-    if result.multi_hand_landmarks:
+    left_state = "IDLE"
+    right_state = "NONE"
 
-        for handLms, handType in zip(result.multi_hand_landmarks,
-                                     result.multi_handedness):
+    if results.multi_hand_landmarks:
 
-            label = handType.classification[0].label
+        for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
+                                              results.multi_handedness):
+
+            label = handedness.classification[0].label
+
+            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+            # =========================
+            # PALM CENTER
+            # =========================
+
+            palm = hand_landmarks.landmark[0]
+
+            cx = int(palm.x * width)
+            cy = int(palm.y * height)
+
+            palm_center = (cx,cy)
+
+            # =========================
+            # DYNAMIC RADIUS
+            # =========================
+
+            wrist = hand_landmarks.landmark[0]
+            middle = hand_landmarks.landmark[9]
+
+            wx = int(wrist.x * width)
+            wy = int(wrist.y * height)
+
+            mx = int(middle.x * width)
+            my = int(middle.y * height)
+
+            dynamic_radius = int(distance((wx,wy),(mx,my))*1.5)
+
+            cv2.circle(frame,palm_center,dynamic_radius,(0,255,255),2)
+
+            # =========================
+            # FINGER CHECK
+            # =========================
+
+            states = finger_states(hand_landmarks,palm_center,dynamic_radius)
+
+            # =========================
+            # LEFT HAND → MOVEMENT
+            # =========================
 
             if label == "Left":
-                hand_detected_left = True
-            if label == "Right":
-                hand_detected_right = True
 
-            cx, cy = get_palm_center(handLms, w, h)
-            radius = get_dynamic_radius(handLms, w, h)
+                closed = states.count(0)
 
-            state = hand_state[label]
+                if closed >= 4:
 
-            if state["cx"] is None:
-                state["cx"], state["cy"] = cx, cy
+                    if not joystick_active:
+                        joystick_center = palm_center
+                        joystick_active = True
 
-            state["cx"] = smooth_value(state["cx"], cx)
-            state["cy"] = smooth_value(state["cy"], cy)
-            state["radius"] = smooth_radius(state["radius"], radius)
+                    cv2.circle(frame,joystick_center,JOYSTICK_RADIUS,(255,255,0),2)
 
-            cx = state["cx"]
-            cy = state["cy"]
-            radius = state["radius"]
+                    dx = cx - joystick_center[0]
+                    dy = cy - joystick_center[1]
 
-            cv2.circle(frame,(cx,cy),radius,(0,255,0),2)
+                    if abs(dx) < DEADZONE and abs(dy) < DEADZONE:
+                        left_state = "MoveForward"
 
-            fingers = finger_state(handLms,(cx,cy),radius,w,h)
+                    elif dx < -DEADZONE:
+                        left_state = "MoveLeft"
 
-            # ---------------- LEFT HAND ----------------
+                    elif dx > DEADZONE:
+                        left_state = "MoveRight"
 
-            if label == "Left":
+                    elif dy < -DEADZONE:
+                        left_state = "Jump"
 
-                if fingers == [0,0,0,0,0]:
-
-                    if left_joystick_center is None:
-                        left_joystick_center = (cx,cy)
-
-                    jx,jy = left_joystick_center
-
-                    cv2.circle(frame,(jx,jy),JOYSTICK_RADIUS,(255,255,0),2)
-                    cv2.circle(frame,(jx,jy),DEADZONE,(100,100,255),2)
-
-                    dx = cx - jx
-                    dy = cy - jy
-
-                    dist = np.sqrt(dx**2 + dy**2)
-
-                    action = "IDLE"
-
-                    if dist < DEADZONE:
-                        action = "MOVE_FORWARD"
-
-                    else:
-
-                        if abs(dx) > abs(dy):
-
-                            if dx < 0:
-                                action = "MOVE_LEFT"
-                            else:
-                                action = "MOVE_RIGHT"
-
-                        else:
-
-                            if dy < 0:
-                                action = "JUMP"
-                            else:
-                                action = "CROUCH"
-
-                    stable = stable_action(action)
-
-                    if stable:
-                        left_action = stable
-
-                    cv2.putText(frame,left_action,(30,50),
-                                cv2.FONT_HERSHEY_SIMPLEX,1,(0,255,255),2)
+                    elif dy > DEADZONE:
+                        left_state = "Crouch"
 
                 else:
-                    left_action = "IDLE"
-                    left_joystick_center = None
 
-            # ---------------- RIGHT HAND ----------------
+                    joystick_active = False
+                    left_state = "IDLE"
+
+            # =========================
+            # RIGHT HAND → AIM
+            # =========================
 
             if label == "Right":
 
-                if fingers == [0,1,1,0,0]:
+                index_tip = hand_landmarks.landmark[8]
+                index_base = hand_landmarks.landmark[5]
 
-                    tip = handLms.landmark[8]
-                    joint = handLms.landmark[6]
+                tx = int(index_tip.x * width)
+                ty = int(index_tip.y * height)
 
-                    tx,ty = int(tip.x*w), int(tip.y*h)
-                    jx,jy = int(joint.x*w), int(joint.y*h)
+                bx = int(index_base.x * width)
+                by = int(index_base.y * height)
 
-                    dx = tx - jx
-                    dy = ty - jy
+                dx = tx - bx
+                dy = ty - by
 
-                    threshold = 15
-                    action = "AIM_CENTER"
+                cv2.arrowedLine(frame,(bx,by),(tx,ty),(0,255,0),3)
 
-                    if abs(dx) > abs(dy):
+                if abs(dx) > abs(dy):
 
-                        if dx > threshold:
-                            action = "AIM_RIGHT"
-                        elif dx < -threshold:
-                            action = "AIM_LEFT"
+                    if dx > 20:
+                        right_state = "AIM_RIGHT"
+                    elif dx < -20:
+                        right_state = "AIM_LEFT"
 
-                    else:
+                else:
 
-                        if dy > threshold:
-                            action = "AIM_DOWN"
-                        elif dy < -threshold:
-                            action = "AIM_UP"
+                    if dy > 20:
+                        right_state = "AIM_DOWN"
+                    elif dy < -20:
+                        right_state = "AIM_UP"
 
-                    stable = stable_action(action)
+    # =========================
+    # SEND UDP
+    # =========================
 
-                    if stable:
-                        right_action = stable
+    send_udp()
 
-                elif fingers == [0,0,0,0,0]:
+    # =========================
+    # DISPLAY
+    # =========================
 
-                    right_action = "ATTACK"
+    cv2.putText(frame,f"L:{left_state}",(20,40),
+                cv2.FONT_HERSHEY_SIMPLEX,1,(0,255,255),2)
 
-                elif fingers == [1,1,1,1,1]:
+    cv2.putText(frame,f"R:{right_state}",(20,80),
+                cv2.FONT_HERSHEY_SIMPLEX,1,(0,255,255),2)
 
-                    right_action = "DEFEND"
-
-            mp_draw.draw_landmarks(frame,handLms,mp_hands.HAND_CONNECTIONS)
-
-    # ---------------- RESET WHEN HAND LOST ----------------
-
-    if not hand_detected_left:
-        left_action = "IDLE"
-        left_joystick_center = None
-
-    if not hand_detected_right:
-        right_action = "NONE"
-
-    # ---------------- SEND TO UNITY ----------------
-
-    data = f"L:{left_action}|R:{right_action}"
-    sock.sendto(data.encode(),(UDP_IP,UDP_PORT))
-
-    cv2.imshow("Hand Control",frame)
+    cv2.imshow("Hand Controller",frame)
 
     if cv2.waitKey(1) & 0xFF == 27:
         break
