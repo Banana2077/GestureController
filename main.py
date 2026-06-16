@@ -72,6 +72,7 @@ JOYSTICK_RADIUS = 120  # Fit nicely in 640x480 screen
 DEADZONE = 40
 
 fixed_joystick_center = (160, 240)  # Center of the left half of the screen
+dynamic_joystick_center = None
 joystick_active = False
 
 # Exponential Moving Average (EMA) variables for smoothing left hand coordinates
@@ -411,15 +412,18 @@ while True:
                     scy = int(smoothed_cy)
 
                     if closed >= 4:
+                        if not joystick_active or dynamic_joystick_center is None:
+                            dynamic_joystick_center = (scx, scy)
+                        
                         joystick_active = True
 
                         # Draw active joystick feedback
-                        cv2.circle(frame, fixed_joystick_center, JOYSTICK_RADIUS, (0, 255, 255), 2)
-                        cv2.line(frame, fixed_joystick_center, (scx, scy), (0, 255, 0), 2)
+                        cv2.circle(frame, dynamic_joystick_center, JOYSTICK_RADIUS, (0, 255, 255), 2)
+                        cv2.line(frame, dynamic_joystick_center, (scx, scy), (0, 255, 0), 2)
                         cv2.circle(frame, (scx, scy), 8, (0, 255, 0), -1)
 
-                        dx = scx - fixed_joystick_center[0]
-                        dy = scy - fixed_joystick_center[1]
+                        dx = scx - dynamic_joystick_center[0]
+                        dy = scy - dynamic_joystick_center[1]
 
                         if abs(dx) < DEADZONE and abs(dy) < DEADZONE:
                             left_state = "Idle"
@@ -442,6 +446,7 @@ while True:
                     else:
                         joystick_active = False
                         left_state = "Idle"
+                        dynamic_joystick_center = None
                         # Reset smoothing when hand is open (not in control/closed state)
                         smoothed_cx = None
                         smoothed_cy = None
@@ -450,73 +455,24 @@ while True:
                 # RIGHT SIDE = AIM
                 # ============================================
                 else:
+                    thumb_bent = (states[0] == 0)
+                    index_bent = (states[1] == 0)
+                    middle_bent = (states[2] == 0)
+                    ring_bent = (states[3] == 0)
+                    pinky_bent = (states[4] == 0)
 
-                    index_tip = hand_landmarks.landmark[8]
-                    index_base = hand_landmarks.landmark[5]
-                    thumb_tip = hand_landmarks.landmark[4]
-                    wrist = hand_landmarks.landmark[0]
-                    middle_base = hand_landmarks.landmark[9]
-
-                    tx = int(index_tip.x * w)
-                    ty = int(index_tip.y * h)
-
-                    bx = int(index_base.x * w)
-                    by = int(index_base.y * h)
-
-                    ux = int(thumb_tip.x * w)
-                    uy = int(thumb_tip.y * h)
-
-                    wx = int(wrist.x * w)
-                    wy = int(wrist.y * h)
-
-                    mx = int(middle_base.x * w)
-                    my = int(middle_base.y * h)
-
-                    dx = tx - bx
-                    dy = ty - by
-
-                    hand_scale = distance((wx, wy), (mx, my))
-                    pinch_dist = distance((tx, ty), (ux, uy))
-
-                    # 1. Pinch to Shoot (High priority)
-                    if pinch_dist < hand_scale * 0.35:
-                        right_state = "AIM_UP"
-                        
-                        # Draw pinch visual feedback (fire effect)
-                        pmx = (tx + ux) // 2
-                        pmy = (ty + uy) // 2
-                        cv2.circle(frame, (pmx, pmy), 12, (0, 0, 255), -1)
-                        cv2.circle(frame, (pmx, pmy), 16, (0, 165, 255), 2)
-                        cv2.putText(
-                            frame,
-                            "SHOOT",
-                            (pmx + 20, pmy + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 0, 255),
-                            2
-                        )
-                    else:
-                        # 2. Pointing to switch target (Normal priority)
-                        cv2.arrowedLine(
-                            frame,
-                            (bx, by),
-                            (tx, ty),
-                            (0, 255, 0),
-                            3
-                        )
-
-                        if abs(dx) > abs(dy):
-                            if dx > 20:
-                                right_state = "AIM_RIGHT"
-                            elif dx < -20:
-                                right_state = "AIM_LEFT"
+                    if thumb_bent:
+                        if index_bent:
+                            right_state = "SHOOT"
+                            cv2.putText(frame, "SHOOT", (palm_center[0], palm_center[1] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        elif middle_bent and ring_bent and pinky_bent:
+                            right_state = "SWITCH_TARGET"
+                            cv2.putText(frame, "SWITCH TARGET", (palm_center[0], palm_center[1] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
                         else:
-                            if dy > 20:
-                                right_state = "AIM_DOWN"
-                            elif dy < -20:
-                                right_state = "AIM_UP"
-
+                            right_state = "AIM"
+                    else:
+                        right_state = "NONE"
+                        
             if not left_hand_detected:
                 smoothed_cx = None
                 smoothed_cy = None
@@ -699,6 +655,7 @@ while True:
         HOLD_FRAMES = 0
 
         joystick_active = False
+        dynamic_joystick_center = None
 
         smoothed_cx = None
         smoothed_cy = None
