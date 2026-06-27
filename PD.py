@@ -3,6 +3,12 @@ import mediapipe as mp
 import numpy as np
 import socket
 import json
+import sys
+import io
+
+# แก้ปัญหาภาษาไทยแสดงเป็น ??? ใน terminal
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # ==================== CONFIG ====================
 HOST          = "127.0.0.1"
@@ -17,17 +23,17 @@ CALIB_FRAMES  = 60   # ~2 วิ ต่อท่า
 FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
 
 # Mapping ปัจจุบัน:
-#   thumb  -> ไม่ใช้
+#   thumb  -> Unused
 #   index  -> ยกแขน (ขึ้น/ลง)
-#   middle -> หมุนแขน (หน้า/หลัง)
-#   ring   -> ยกขา (ด้านข้าง)
-#   pinky  -> ขา (หน้า/หลัง)
+#   middle -> Arm Swing (Fwd/Back)
+#   ring   -> Leg Lift (Side)
+#   pinky  -> Leg Swing (Fwd/Back)
 LIMB_LABELS = {
-    "thumb":  "ไม่ใช้",
+    "thumb":  "Unused",
     "index":  "ยกแขน (ขึ้น/ลง)",
-    "middle": "หมุนแขน (หน้า/หลัง)",
-    "ring":   "ยกขา (ด้านข้าง)",
-    "pinky":  "ขา (หน้า/หลัง)",
+    "middle": "Arm Swing (Fwd/Back)",
+    "ring":   "Leg Lift (Side)",
+    "pinky":  "Leg Swing (Fwd/Back)",
 }
 DEBUG_COLORS = {
     "thumb": (150,150,150), "index": (50,200,100),
@@ -178,16 +184,16 @@ def draw_overlay_message(frame, title, msg1, msg2, color, countdown=None):
 def draw_status(frame, detected_hands: set):
     h = frame.shape[0]
     for i, hand in enumerate(["Left", "Right"]):
-        hand_th  = "มือซ้าย" if hand == "Left" else "มือขวา"
+        hand_th  = "Left Hand" if hand == "Left" else "Right Hand"
         detected = hand in detected_hands
         calib_ok = is_calibrated[hand]
 
         if detected and calib_ok:
             color, label = (50,200,100), f"{hand_th} ✓"
         elif detected and not calib_ok:
-            color, label = (0,165,255), f"{hand_th} (ยังไม่ calibrate)"
+            color, label = (0,165,255), f"{hand_th} (Not calibrated)"
         else:
-            color, label = (80,80,80), f"{hand_th} ไม่พบ"
+            color, label = (80,80,80), f"{hand_th} Not found"
 
         cv2.putText(frame, label, (10 + i * 300, h - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
@@ -212,8 +218,8 @@ def main():
     calib_phase = "ready"
     calib_timer = 0
 
-    print(f"[Ready] ส่งข้อมูลไปที่ {HOST}:{PORT}")
-    print("[Auto-Calibration] กำลังเริ่ม... กด R เพื่อ calibrate ใหม่, Q เพื่อหยุด")
+    print(f"[Ready] Sending to  {HOST}:{PORT}")
+    print("[Auto-Calibration] Starting... Press R to recalibrate, Q เพื่อหยุด")
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -223,7 +229,7 @@ def main():
         frame   = cv2.flip(frame, 1)
         results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        # จัดกลุ่ม landmark ตามมือซ้าย/ขวา
+        # จัดกลุ่ม landmark ตามLeft Hand/ขวา
         hand_map = {}
         if results.multi_hand_landmarks:
             for hand_lm, handedness in zip(results.multi_hand_landmarks,
@@ -240,9 +246,9 @@ def main():
             calib_timer += 1
             remaining = max(0, READY_FRAMES - calib_timer) // 15 + 1
             draw_overlay_message(
-                frame, "เตรียมตัว Calibrate",
-                "ยกมือทั้งสองข้างให้กล้องเห็น",
-                "เดี๋ยวจะให้กางมือ และกำมือ",
+                frame, "Prepare to Calibrate",
+                "Raise both hands for the camera",
+                "Will ask to open then close hands",
                 (0,165,255), remaining
             )
             if calib_timer >= READY_FRAMES:
@@ -258,9 +264,9 @@ def main():
 
             remaining = max(0, CALIB_FRAMES - calib_timer)
             draw_overlay_message(
-                frame, "ขั้นที่ 1/2",
-                "กางมือออกให้สุดทั้งสองข้าง",
-                "เหยียดทุกนิ้วให้ตรง",
+                frame, "Step 1/2",
+                "Open both hands fully",
+                "Extend all fingers straight",
                 (50,200,100), remaining
             )
             calib_timer += 1
@@ -273,9 +279,9 @@ def main():
 
             remaining = max(0, CALIB_FRAMES - calib_timer)
             draw_overlay_message(
-                frame, "ขั้นที่ 2/2",
-                "กำมือให้แน่นทั้งสองข้าง",
-                "งอทุกนิ้วให้สุด",
+                frame, "Step 2/2",
+                "Close both hands tightly",
+                "Curl all fingers fully",
                 (50,150,255), remaining
             )
             calib_timer += 1
@@ -313,7 +319,7 @@ def main():
             break
         elif key == ord('r'):
             calib_phase, calib_timer = "ready", 0
-            print("[Auto-Calibration] เริ่มใหม่...")
+            print("[Auto-Calibration] Restarting...")
 
     cap.release()
     hands.close()
