@@ -11,8 +11,26 @@ import time
 # ============================================
 # LOAD MODEL
 # ============================================
-with open("model.pkl", "rb") as f:
-    model, le, scaler = pickle.load(f)
+import os
+# pyrefly: ignore [missing-import]
+from ultralytics import YOLO
+
+model_path = "best.pt"
+if os.path.exists(model_path):
+    model = YOLO(model_path)
+    print(f"[YOLO] Loaded model from {model_path}")
+else:
+    print(f"[YOLO ERROR] Model not found at '{model_path}'")
+    model = None
+
+# Mapping dictionary from YOLO class name to Unity gesture name
+YOLO_GESTURE_MAPPING = {
+    "class_0": "rabbit",
+    "class_1": "dog",
+    "class_2": "bird",
+    "class_3": "cow",
+    "class_4": "deer",
+}
 
 # ============================================
 # MEDIAPIPE
@@ -27,6 +45,9 @@ hands = mp_hands.Hands(
     min_tracking_confidence=0.7
 )
 
+# Selfie Segmentation initialization removed to optimize performance
+selfie_segmentation = None
+
 # ============================================
 # CAMERA
 # ============================================
@@ -40,8 +61,12 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 # ============================================
 GESTURE_LABELS = {
     "rabbit": "rabbit",
+    "dog": "dog",
     "bird": "bird",
-    "frog": "frog",
+    "cow": "cow",
+    "deer": "deer",
+    
+
 }
 
 CONFIDENCE_THRESHOLD = 0.5
@@ -60,7 +85,8 @@ HOLD_REQUIRED = 5
 gesture_text = ""
 final_gesture = "dont"
 
-GESTURE_DURATION = 0.75
+#GESTURE_DURATION = 0.75
+GESTURE_DURATION = 3
 gesture_start_time = 0
 
 gesture_votes = {}
@@ -90,6 +116,56 @@ client_conn = None
 client_lock = threading.Lock()
 
 running = True
+
+# ============================================
+# YOLO THREAD FOR ASYNC INFERENCE
+# ============================================
+import queue
+yolo_queue = queue.Queue(maxsize=1)
+yolo_result = ("Not sure...", 0.0, None)
+yolo_lock = threading.Lock()
+
+def yolo_worker():
+    global yolo_result
+    while running:
+        try:
+            img = yolo_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        
+        if img is None:
+            break
+            
+        if model is not None:
+            try:
+                yolo_results = model(img, verbose=False)
+                best_conf = 0.0
+                best_pred = None
+                best_box = None
+
+                for r in yolo_results:
+                    if r.boxes is not None:
+                        for box in r.boxes:
+                            conf = float(box.conf[0])
+                            cls_id = int(box.cls[0])
+                            if conf > best_conf:
+                                best_conf = conf
+                                best_pred = r.names[cls_id]
+                                best_box = list(map(int, box.xyxy[0].tolist()))
+                
+                with yolo_lock:
+                    if best_conf >= CONFIDENCE_THRESHOLD and best_pred is not None:
+                        pred_gesture = YOLO_GESTURE_MAPPING.get(best_pred, best_pred)
+                        yolo_result = (pred_gesture, best_conf, best_box)
+                        gesture_votes[pred_gesture] = gesture_votes.get(pred_gesture, 0) + 1
+                    else:
+                        yolo_result = ("Not sure...", 0.0, None)
+            except Exception as e:
+                print(f"[YOLO Thread Error] {e}")
+        yolo_queue.task_done()
+
+yolo_thread = threading.Thread(target=yolo_worker, daemon=True)
+yolo_thread.start()
 
 last_tcp_message = ""
 
@@ -263,6 +339,10 @@ while True:
     results = hands.process(rgb)
 
     h, w, _ = frame.shape
+    
+    # Initialize a black silhouette frame for GESTURE mode
+    import numpy as np
+    silhouette_frame = np.zeros_like(frame)
 
     left_state = "Idle"
     right_state = "NONE"
@@ -272,7 +352,7 @@ while True:
     # ============================================
     if results.multi_hand_landmarks:
 
-        all_open = all(
+        all_open = len(results.multi_hand_landmarks) == 2 and all(
             is_open_hand(hl)
             for hl in results.multi_hand_landmarks
         )
@@ -324,7 +404,18 @@ while True:
 
                 final_gesture = "dont"
 
-                gesture_votes = {}
+                with yolo_lock:
+                    gesture_votes = {}
+                    yolo_result = ("Not sure...", 0.0, None)
+                    # Clear queue from any leftover frames
+                    try:
+                        while not yolo_queue.empty():
+                            yolo_queue.get_nowait()
+                            yolo_queue.task_done()
+                    except queue.Empty:
+                        pass
+
+                gesture_frame_count = 0
 
                 gesture_start_time = time.time()
 
@@ -466,10 +557,10 @@ while True:
                             right_state = "SHOOT"
                             cv2.putText(frame, "SHOOT", (palm_center[0], palm_center[1] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                         elif middle_bent and ring_bent and pinky_bent:
-                            right_state = "SWITCH_TARGET"
-                            cv2.putText(frame, "SWITCH TARGET", (palm_center[0], palm_center[1] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-                        else:
                             right_state = "AIM"
+                            cv2.putText(frame, "AIM", (palm_center[0], palm_center[1] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+                        else:
+                            right_state = "SWITCH TARGET"
                     else:
                         right_state = "NONE"
                         
@@ -485,41 +576,44 @@ while True:
         elif MODE == "GESTURE":
 
             elapsed = time.time() - gesture_start_time
-
             remaining = GESTURE_DURATION - elapsed
 
-            row = []
+            gesture_frame_count += 1
+            silhouette_frame = np.zeros_like(frame)
 
+            # Extract hand silhouettes and draw landmarks
             for hand_landmarks in results.multi_hand_landmarks:
+                x_coords = [lm.x * w for lm in hand_landmarks.landmark]
+                y_coords = [lm.y * h for lm in hand_landmarks.landmark]
 
-                x_coords = [lm.x for lm in hand_landmarks.landmark]
-                y_coords = [lm.y for lm in hand_landmarks.landmark]
+                x_min = int(min(x_coords)) - 20
+                x_max = int(max(x_coords)) + 20
+                y_min = int(min(y_coords)) - 20
+                y_max = int(max(y_coords)) + 20
 
-                x_min = min(x_coords)
-                x_max = max(x_coords)
+                # Clip to frame boundaries
+                x_min = max(x_min, 0)
+                x_max = min(x_max, w)
+                y_min = max(y_min, 0)
+                y_max = min(y_max, h)
 
-                y_min = min(y_coords)
-                y_max = max(y_coords)
+                if x_max > x_min and y_max > y_min:
+                    # Crop directly from frame without selfie segmentation
+                    hand_roi = frame[y_min:y_max, x_min:x_max]
 
-                box_w = x_max - x_min
-                box_h = y_max - y_min
+                    if hand_roi.size > 0:
+                        gray = cv2.cvtColor(hand_roi, cv2.COLOR_BGR2GRAY)
+                        _, mask = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
 
-                pad = 0.02
+                        hand_canvas = np.zeros_like(hand_roi)
+                        hand_canvas[:] = (255, 255, 255)
+                        mask_3ch = cv2.merge([mask, mask, mask])
+                        hand_result = np.where(mask_3ch == 255, hand_canvas, 0)
 
-                x1 = int((x_min - pad) * w)
-                y1 = int((y_min - pad) * h)
+                        silhouette_frame[y_min:y_max, x_min:x_max] = hand_result
 
-                x2 = int((x_max + pad) * w)
-                y2 = int((y_max + pad) * h)
-
-                cv2.rectangle(
-                    frame,
-                    (x1, y1),
-                    (x2, y2),
-                    (0, 255, 0),
-                    2
-                )
-
+                # Draw bounding box and landmarks on visual feedback
+                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
                 mp_draw.draw_landmarks(
                     frame,
                     hand_landmarks,
@@ -528,51 +622,27 @@ while True:
                     mp_drawing_styles.get_default_hand_connections_style()
                 )
 
-                for lm in hand_landmarks.landmark:
+            # Enqueue to YOLO thread asynchronously (every 3 frames, if space available)
+            if gesture_frame_count % 3 == 0:
+                try:
+                    yolo_queue.put_nowait(silhouette_frame.copy())
+                except queue.Full:
+                    pass
 
-                    x_norm = (
-                        (lm.x - x_min) / box_w
-                        if box_w > 0 else 0.0
-                    )
+            # Read latest prediction from YOLO thread
+            with yolo_lock:
+                pred_gesture, conf, best_box = yolo_result
 
-                    y_norm = (
-                        (lm.y - y_min) / box_h
-                        if box_h > 0 else 0.0
-                    )
-
-                    row.extend([
-                        x_norm,
-                        y_norm,
-                        lm.z
-                    ])
-
-            if len(results.multi_hand_landmarks) == 1:
-                row.extend([0.0] * 63)
-
-            if len(row) == 126:
-
-                row_scaled = scaler.transform([row])
-
-                proba = model.predict_proba(row_scaled)[0]
-
-                confidence_val = proba.max()
-
-                pred_index = proba.argmax()
-
-                pred_name = le.inverse_transform([pred_index])[0]
-
-                if confidence_val >= CONFIDENCE_THRESHOLD:
-
-                    gesture_text = (
-                        f"{pred_name} ({confidence_val:.0%})"
-                    )
-
-                    gesture_votes[pred_name] = (
-                        gesture_votes.get(pred_name, 0) + 1
-                    )
-
-                else:
-                    gesture_text = "Not sure..."
+            if conf > 0:
+                gesture_text = f"{pred_gesture} ({conf:.0%})"
+                # Draw YOLO detection on visual feedback frame
+                if best_box is not None:
+                    x1s, y1s, x2s, y2s = best_box
+                    cv2.rectangle(frame, (x1s, y1s), (x2s, y2s), (0, 255, 255), 2)
+                    cv2.putText(frame, gesture_text, (x1s, y1s - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            else:
+                gesture_text = "Not sure..."
 
             # ============================================
             # COUNTDOWN BAR
@@ -614,24 +684,25 @@ while True:
             # ============================================
             if elapsed >= GESTURE_DURATION:
 
-                if len(gesture_votes) > 0:
+                with yolo_lock:
+                    if len(gesture_votes) > 0:
 
-                    final_gesture = max(
-                        gesture_votes,
-                        key=gesture_votes.get
-                    )
+                        final_gesture = max(
+                            gesture_votes,
+                            key=gesture_votes.get
+                        )
 
-                    send_tcp(
-                        "",
-                        gesture=final_gesture
-                    )
+                        send_tcp(
+                            "",
+                            gesture=final_gesture
+                        )
 
-                    print(
-                        f"[GESTURE] FINAL: {final_gesture}"
-                    )
+                        print(
+                            f"[GESTURE] FINAL: {final_gesture}"
+                        )
 
-                else:
-                    send_tcp("dont")
+                    else:
+                        send_tcp("dont")
 
                 send_tcp("control")
 
@@ -757,6 +828,13 @@ while True:
 # CLEANUP
 # ============================================
 running = False
+
+# Stop YOLO thread
+try:
+    yolo_queue.put(None)
+    yolo_thread.join(timeout=1.0)
+except:
+    pass
 
 try:
     if client_conn:
