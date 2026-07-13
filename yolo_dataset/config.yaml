@@ -3,7 +3,6 @@ names:
   1: class_1
   2: class_2
   3: class_3
-  4: class_4
 path: /content/yolo_dataset
 train: train/images
 val: val/images

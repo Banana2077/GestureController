@@ -1,4 +1,5 @@
 import cv2
+import math
 # pyrefly: ignore [missing-import]
 import mediapipe as mp
 import numpy as np
@@ -70,6 +71,45 @@ def apply_filters(roi, brightness, contrast, saturation, warmth):
     roi = cv2.merge((b, g, r))
     return roi
 
+def group_hands(multi_hand_landmarks, w, h):
+    """
+    Groups hands that are close to each other.
+    Returns a list of lists of hand_landmarks.
+    """
+    if not multi_hand_landmarks:
+        return []
+    
+    # If there is only one hand, it's a single group
+    if len(multi_hand_landmarks) == 1:
+        return [[multi_hand_landmarks[0]]]
+        
+    # If there are two hands, check proximity
+    h1 = multi_hand_landmarks[0]
+    h2 = multi_hand_landmarks[1]
+    
+    p1 = h1.landmark[0]
+    p2 = h2.landmark[0]
+    palm1 = (p1.x * w, p1.y * h)
+    palm2 = (p2.x * w, p2.y * h)
+    
+    dist = math.sqrt((palm1[0] - palm2[0])**2 + (palm1[1] - palm2[1])**2)
+    
+    h1_w = (max(lm.x for lm in h1.landmark) - min(lm.x for lm in h1.landmark)) * w
+    h1_h = (max(lm.y for lm in h1.landmark) - min(lm.y for lm in h1.landmark)) * h
+    size1 = max(h1_w, h1_h)
+    
+    h2_w = (max(lm.x for lm in h2.landmark) - min(lm.x for lm in h2.landmark)) * w
+    h2_h = (max(lm.y for lm in h2.landmark) - min(lm.y for lm in h2.landmark)) * h
+    size2 = max(h2_w, h2_h)
+    
+    avg_size = (size1 + size2) / 2.0
+    
+    # If palms are within 2.5 times the average hand size, they are "close"
+    if dist < (avg_size * 2.5):
+        return [[h1, h2]]
+    else:
+        return [[h1], [h2]]
+
 print("--- Start YOLO Hand Shadow Dataset Collector ---")
 print("Press 'a' to toggle Save Mode (ON/OFF)")
 print("Press 'd' to toggle YOLO Shadow Detection (requires model)")
@@ -107,21 +147,33 @@ while True:
         # Output contains only the hand silhouette inside the bounding box(es)
         output = np.zeros_like(output_frame)
 
-        # List to store bounding boxes of detected hands
-        PosXmin = []
-        PosXmax = []
-        PosYmin = []
-        PosYmax = []
-
         if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                x_coords = [lm.x * w for lm in hand_landmarks.landmark]
-                y_coords = [lm.y * h for lm in hand_landmarks.landmark]
+            hand_groups = group_hands(results.multi_hand_landmarks, w, h)
+            
+            for hand_group in hand_groups:
+                # Combine coordinates of all hands in the group
+                x_coords = []
+                y_coords = []
+                for hand_landmarks in hand_group:
+                    x_coords.extend([lm.x * w for lm in hand_landmarks.landmark])
+                    y_coords.extend([lm.y * h for lm in hand_landmarks.landmark])
+                    
+                    # Draw landmarks on the original camera view
+                    mp_drawing.draw_landmarks(original, hand_landmarks, mp_hands.HAND_CONNECTIONS)
                 
-                x_min = int(min(x_coords)) - handScale
-                x_max = int(max(x_coords)) + handScale
-                y_min = int(min(y_coords)) - handScale
-                y_max = int(max(y_coords)) + handScale
+                hand_w_raw = max(x_coords) - min(x_coords)
+                hand_h_raw = max(y_coords) - min(y_coords)
+                hand_size = max(hand_w_raw, hand_h_raw)
+                
+                # Dynamic square crop calculation based on trackbar percentage
+                half_crop_size = hand_size * (0.5 + (handScale / 100.0))
+                x_center = (min(x_coords) + max(x_coords)) / 2.0
+                y_center = (min(y_coords) + max(y_coords)) / 2.0
+                
+                x_min = int(x_center - half_crop_size)
+                x_max = int(x_center + half_crop_size)
+                y_min = int(y_center - half_crop_size)
+                y_max = int(y_center + half_crop_size)
                 
                 # Clip to image boundaries
                 x_min, x_max = max(x_min, 0), min(x_max, w)
@@ -129,11 +181,6 @@ while True:
                 
                 # Check for valid bounding box shape
                 if x_max > x_min and y_max > y_min:
-                    PosXmin.append(x_min)
-                    PosXmax.append(x_max)
-                    PosYmin.append(y_min)
-                    PosYmax.append(y_max)
-                    
                     hand_roi = output_frame[y_min:y_max, x_min:x_max]
                     
                     if hand_roi.size > 0:
@@ -148,72 +195,65 @@ while True:
                         # Apply filters to hand only
                         hand_filtered = apply_filters(hand_result, 50, 50, 50, 50)
 
-                        # Resize/paste back to output canvas
+                        # Paste back to output canvas
                         output[y_min:y_max, x_min:x_max] = hand_filtered
+                        
+                        # Generate cropped image for saving/testing (640x640)
+                        save_img = cv2.resize(hand_filtered, (640, 640), interpolation=cv2.INTER_NEAREST)
+                        
+                        # Save if save mode is ON
+                        if save_crop:
+                            try:
+                                classI = presskey
+                                img_path = f"images/hand{classI}_{frame_id}.jpg"
+                                cv2.imwrite(img_path, save_img)
+                                
+                                crop_w = x_max - x_min
+                                crop_h = y_max - y_min
+                                
+                                x_center_rel = ((min(x_coords) + max(x_coords)) / 2.0 - x_min) / crop_w
+                                y_center_rel = ((min(y_coords) + max(y_coords)) / 2.0 - y_min) / crop_h
+                                width_rel = (max(x_coords) - min(x_coords)) / crop_w
+                                height_rel = (max(y_coords) - min(y_coords)) / crop_h
+                                
+                                label_path = f"labels/hand{classI}_{frame_id}.txt"
+                                with open(label_path, "w") as f:
+                                    f.write(f"{classI} {x_center_rel:.6f} {y_center_rel:.6f} {width_rel:.6f} {height_rel:.6f}\n")
+                                
+                                print(f"Saved cropped hand(s) {frame_id}: Class {classI} (Box: {x_center_rel:.4f}, {y_center_rel:.4f})")
+                                frame_id += 1
+                            except Exception as e:
+                                print(f"Error saving crop: {e}")
+                        
+                        # Run YOLO detection on cropped hand(s) if detect mode is ON and model loaded
+                        if detect and model_loaded and model_shadow is not None:
+                            try:
+                                results_shadow = model_shadow(save_img, verbose=False)
+                                crop_w = x_max - x_min
+                                crop_h = y_max - y_min
+                                for shadow_result in results_shadow:
+                                    shadow_boxes = shadow_result.boxes
+                                    if shadow_boxes is not None:
+                                        for shadow_box in shadow_boxes:
+                                            nx1, ny1, nx2, ny2 = map(float, shadow_box.xyxyn[0].tolist())
+                                            # Map back to full frame
+                                            x1s = int(x_min + nx1 * crop_w)
+                                            y1s = int(y_min + ny1 * crop_h)
+                                            x2s = int(x_min + nx2 * crop_w)
+                                            y2s = int(y_min + ny2 * crop_h)
+                                            conf_s = float(shadow_box.conf[0])
+                                            cls_s = int(shadow_box.cls[0])
+                                            
+                                            # Draw predicted bounding box
+                                            cv2.rectangle(output, (x1s, y1s), (x2s, y2s), (0, 255, 0), 2)
+                                            label_text = f"{model_shadow.names[cls_s]} {conf_s:.2f}"
+                                            cv2.putText(output, label_text, (x1s, y1s - 10), 
+                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                            except Exception as e:
+                                print(f"Shadow detection error: {e}")
 
-                # Draw landmarks on the original camera view
-                mp_drawing.draw_landmarks(original, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-        # Create a clean copy of the output (only black background + white hands) for saving
-        # so that blue bounding boxes, green YOLO boxes, or text are NOT saved as training data.
-        save_frame = output.copy()
-
-        # Run YOLO detection on 'output' if detect mode is ON and model is loaded
-        if detect and model_loaded and model_shadow is not None:
-            try:
-                results_shadow = model_shadow(output, show=False)
-                for shadow_result in results_shadow:
-                    shadow_boxes = shadow_result.boxes
-                    if shadow_boxes is not None:
-                        for shadow_box in shadow_boxes:
-                            x1s, y1s, x2s, y2s = map(int, shadow_box.xyxy[0].tolist())
-                            conf_s = float(shadow_box.conf[0])
-                            cls_s = int(shadow_box.cls[0])
-                            
-                            # Draw predicted bounding box
-                            cv2.rectangle(output, (x1s, y1s), (x2s, y2s), (0, 255, 0), 2)
-                            
-                            # Draw prediction label
-                            label_text = f"{model_shadow.names[cls_s]} {conf_s:.2f}"
-                            cv2.putText(output, label_text, (x1s, y1s - 10), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            except Exception as e:
-                print(f"Shadow detection error: {e}")
-
-        # If hands are detected, draw the main encompassing bounding box and handle saving
-        if len(PosXmin) > 0:
-            MiNx = min(PosXmin)
-            MaXx = max(PosXmax)
-            MiNy = min(PosYmin)
-            MaXy = max(PosYmax)
-            
-            classI = presskey  # Class index
-
-            # Save frame and label
-            if save_crop:
-                try:
-                    if save_frame.size > 0:
-                        img_path = f"images/hand{classI}_{frame_id}.jpg"
-                        cv2.imwrite(img_path, save_frame)
-
-                        # Calculate YOLOv8 label (normalized coordinates)
-                        img_h, img_w = save_frame.shape[:2]
-                        x_center = ((MiNx + MaXx) / 2.0) / img_w
-                        y_center = ((MiNy + MaXy) / 2.0) / img_h
-                        width = (MaXx - MiNx) / img_w
-                        height = (MaXy - MiNy) / img_h
-
-                        label_path = f"labels/hand{classI}_{frame_id}.txt"
-                        with open(label_path, "w") as f:
-                            f.write(f"{classI} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
-
-                        print(f"Saved frame {frame_id}: Class {classI} (Box: {x_center:.4f}, {y_center:.4f}, {width:.4f}, {height:.4f})")
-                        frame_id += 1
-                except Exception as e:
-                    print(f"Error saving crop: {e}")
-
-            # Draw encompass blue bounding box on display output only (not in saved file)
-            cv2.rectangle(output, (int(MiNx), int(MiNy)), (int(MaXx), int(MaXy)), (255, 0, 0), 2)
+                        # Draw encompass blue bounding box on display output per group
+                        cv2.rectangle(output, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
 
     except Exception as e:
         print(f"Main loop error: {e}")

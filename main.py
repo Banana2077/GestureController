@@ -129,19 +129,21 @@ def yolo_worker():
     global yolo_result
     while running:
         try:
-            img = yolo_queue.get(timeout=0.1)
+            item = yolo_queue.get(timeout=0.1)
         except queue.Empty:
             continue
         
-        if img is None:
+        if item is None:
             break
             
+        img, x_min, y_min, crop_w, crop_h = item
+        
         if model is not None:
             try:
                 yolo_results = model(img, verbose=False)
                 best_conf = 0.0
                 best_pred = None
-                best_box = None
+                best_box_rel = None
 
                 for r in yolo_results:
                     if r.boxes is not None:
@@ -151,12 +153,21 @@ def yolo_worker():
                             if conf > best_conf:
                                 best_conf = conf
                                 best_pred = r.names[cls_id]
-                                best_box = list(map(int, box.xyxy[0].tolist()))
+                                best_box_rel = list(map(float, box.xyxyn[0].tolist()))
                 
                 with yolo_lock:
                     if best_conf >= CONFIDENCE_THRESHOLD and best_pred is not None:
                         pred_gesture = YOLO_GESTURE_MAPPING.get(best_pred, best_pred)
-                        yolo_result = (pred_gesture, best_conf, best_box)
+                        
+                        # Map relative coordinates back to full frame
+                        nx1, ny1, nx2, ny2 = best_box_rel
+                        x1s = int(x_min + nx1 * crop_w)
+                        y1s = int(y_min + ny1 * crop_h)
+                        x2s = int(x_min + nx2 * crop_w)
+                        y2s = int(y_min + ny2 * crop_h)
+                        best_box_full = [x1s, y1s, x2s, y2s]
+                        
+                        yolo_result = (pred_gesture, best_conf, best_box_full)
                         gesture_votes[pred_gesture] = gesture_votes.get(pred_gesture, 0) + 1
                     else:
                         yolo_result = ("Not sure...", 0.0, None)
@@ -321,6 +332,45 @@ def finger_states(hand_landmarks, palm_center, radius, w, h):
         )
 
     return states
+
+def group_hands(multi_hand_landmarks, w, h):
+    """
+    Groups hands that are close to each other.
+    Returns a list of lists of hand_landmarks.
+    """
+    if not multi_hand_landmarks:
+        return []
+    
+    # If there is only one hand, it's a single group
+    if len(multi_hand_landmarks) == 1:
+        return [[multi_hand_landmarks[0]]]
+        
+    # If there are two hands, check proximity
+    h1 = multi_hand_landmarks[0]
+    h2 = multi_hand_landmarks[1]
+    
+    p1 = h1.landmark[0]
+    p2 = h2.landmark[0]
+    palm1 = (p1.x * w, p1.y * h)
+    palm2 = (p2.x * w, p2.y * h)
+    
+    dist = math.sqrt((palm1[0] - palm2[0])**2 + (palm1[1] - palm2[1])**2)
+    
+    h1_w = (max(lm.x for lm in h1.landmark) - min(lm.x for lm in h1.landmark)) * w
+    h1_h = (max(lm.y for lm in h1.landmark) - min(lm.y for lm in h1.landmark)) * h
+    size1 = max(h1_w, h1_h)
+    
+    h2_w = (max(lm.x for lm in h2.landmark) - min(lm.x for lm in h2.landmark)) * w
+    h2_h = (max(lm.y for lm in h2.landmark) - min(lm.y for lm in h2.landmark)) * h
+    size2 = max(h2_w, h2_h)
+    
+    avg_size = (size1 + size2) / 2.0
+    
+    # If palms are within 2.5 times the average hand size, they are "close"
+    if dist < (avg_size * 2.5):
+        return [[h1, h2]]
+    else:
+        return [[h1], [h2]]
 
 # ============================================
 # MAIN LOOP
@@ -579,23 +629,46 @@ while True:
             remaining = GESTURE_DURATION - elapsed
 
             gesture_frame_count += 1
-            silhouette_frame = np.zeros_like(frame)
+            yolo_input = None
 
-            # Extract hand silhouettes and draw landmarks
-            for hand_landmarks in results.multi_hand_landmarks:
-                x_coords = [lm.x * w for lm in hand_landmarks.landmark]
-                y_coords = [lm.y * h for lm in hand_landmarks.landmark]
+            # Group close hands
+            hand_groups = group_hands(results.multi_hand_landmarks, w, h)
 
-                x_min = int(min(x_coords)) - 20
-                x_max = int(max(x_coords)) + 20
-                y_min = int(min(y_coords)) - 20
-                y_max = int(max(y_coords)) + 20
+            # Process hand groups
+            for hand_group in hand_groups:
+                # Combine coordinates of all hands in the group
+                x_coords = []
+                y_coords = []
+                for hand_landmarks in hand_group:
+                    x_coords.extend([lm.x * w for lm in hand_landmarks.landmark])
+                    y_coords.extend([lm.y * h for lm in hand_landmarks.landmark])
+                    
+                    # Draw landmarks on visual feedback
+                    mp_draw.draw_landmarks(
+                        frame,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing_styles.get_default_hand_landmarks_style(),
+                        mp_drawing_styles.get_default_hand_connections_style()
+                    )
+
+                hand_w_raw = max(x_coords) - min(x_coords)
+                hand_h_raw = max(y_coords) - min(y_coords)
+                hand_size = max(hand_w_raw, hand_h_raw)
+                
+                # Dynamic square crop calculation (20% padding)
+                half_crop_size = hand_size * 0.70
+                x_center = (min(x_coords) + max(x_coords)) / 2.0
+                y_center = (min(y_coords) + max(y_coords)) / 2.0
+                
+                x_min = int(x_center - half_crop_size)
+                x_max = int(x_center + half_crop_size)
+                y_min = int(y_center - half_crop_size)
+                y_max = int(y_center + half_crop_size)
 
                 # Clip to frame boundaries
-                x_min = max(x_min, 0)
-                x_max = min(x_max, w)
-                y_min = max(y_min, 0)
-                y_max = min(y_max, h)
+                x_min, x_max = max(x_min, 0), min(x_max, w)
+                y_min, y_max = max(y_min, 0), min(y_max, h)
 
                 if x_max > x_min and y_max > y_min:
                     # Crop directly from frame without selfie segmentation
@@ -609,23 +682,20 @@ while True:
                         hand_canvas[:] = (255, 255, 255)
                         mask_3ch = cv2.merge([mask, mask, mask])
                         hand_result = np.where(mask_3ch == 255, hand_canvas, 0)
+                        
+                        crop_img = cv2.resize(hand_result, (640, 640), interpolation=cv2.INTER_NEAREST)
+                        crop_w = x_max - x_min
+                        crop_h = y_max - y_min
+                        
+                        yolo_input = (crop_img.copy(), x_min, y_min, crop_w, crop_h)
 
-                        silhouette_frame[y_min:y_max, x_min:x_max] = hand_result
-
-                # Draw bounding box and landmarks on visual feedback
-                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                mp_draw.draw_landmarks(
-                    frame,
-                    hand_landmarks,
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style(),
-                    mp_drawing_styles.get_default_hand_connections_style()
-                )
+                # Draw bounding box on visual feedback per group
+                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
 
             # Enqueue to YOLO thread asynchronously (every 3 frames, if space available)
-            if gesture_frame_count % 3 == 0:
+            if yolo_input is not None and gesture_frame_count % 3 == 0:
                 try:
-                    yolo_queue.put_nowait(silhouette_frame.copy())
+                    yolo_queue.put_nowait(yolo_input)
                 except queue.Full:
                     pass
 
