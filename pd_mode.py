@@ -1,8 +1,9 @@
 """
-pd_mode.py  -  Finger-Curl Tracking Mode (PD Mode) without Calibration
+pd_mode.py  -  Finger-Curl Tracking Mode (PD Mode) with Auto-Calibration
 ======================================================================
 Tracks raw finger curl values (0.0 to 1.0) using Mediapipe and sends them
-directly to Unity via UDP on port 5052.
+directly to Unity via UDP on port 5052. Includes an automatic calibration
+mechanism that dynamically learns each user's finger ranges during runtime.
 
 Protocol
 --------
@@ -48,6 +49,11 @@ FINGER_JOINTS = {
     "pinky":  [17, 18, 19, 20],
 }
 
+# กำหนดขอบเขตความกว้างองศาเริ่มต้นเพื่อเซฟและป้องกันระบบแกว่งตัวในเฟรมแรกๆ
+# (เมื่อผู้ใช้ขยับมือ นิ้วที่เหยียด/งอเกินค่านี้ ระบบจะอัปเดตขยายขอบเขตอัตโนมัติ)
+DEFAULT_MIN_ANGLE = 100.0  # ค่าเริ่มต้นสำหรับงอนิ้ว (จะค่อยๆ ปรับลดลงตามความงอจริง)
+DEFAULT_MAX_ANGLE = 120.0  # ค่าเริ่มต้นสำหรับเหยียดนิ้ว (จะค่อยๆ ปรับเพิ่มขึ้นตามความเหยียดจริง)
+
 
 # ==================== MATH HELPERS ====================
 
@@ -59,27 +65,22 @@ def _calc_angle(a, b, c) -> float:
     return float(np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0))))
 
 
-def _get_finger_curl(landmarks, name: str) -> float:
+def _get_finger_angle(landmarks, name: str) -> float:
     """
-    Returns finger curl value.
-    0.0 = straight  |  1.0 = fully curled
+    คืนค่ามุมองศาจริงของนิ้ว (องศา)
+    - นิ้วทั่วไป: หามุมเฉลี่ยระหว่างข้อต่อ PIP และ DIP
+    - นิ้วโป้ง: หามุมข้อต่อ MCP (จุด 1-2-4)
     """
     def pt(i):
         return np.array([landmarks[i].x, landmarks[i].y, landmarks[i].z])
 
     if name == "thumb":
-        angle = _calc_angle(pt(1), pt(2), pt(4))
-        return float(1.0 - np.clip((angle - 30) / 140.0, 0.0, 1.0))
+        return _calc_angle(pt(1), pt(2), pt(4))
     else:
         mcp, pip, dip, tip = FINGER_JOINTS[name]
         angle_pip = _calc_angle(pt(mcp), pt(pip), pt(dip))
         angle_dip = _calc_angle(pt(pip), pt(dip), pt(tip))
-        avg_angle = (angle_pip + angle_dip) / 2.0
-        return float(1.0 - np.clip((avg_angle - 30) / 140.0, 0.0, 1.0))
-
-
-def _get_raw_values(landmarks) -> dict:
-    return {name: _get_finger_curl(landmarks, name) for name in FINGER_NAMES}
+        return float((angle_pip + angle_dip) / 2.0)
 
 
 def _is_valid(hand_landmarks) -> bool:
@@ -107,25 +108,31 @@ class PDMode:
             "Right": {n: 0.0 for n in FINGER_NAMES},
         }
 
-        print(f"[PD Mode] Initialized (Direct mode, no calibration). UDP -> {host}:{port}")
+        # เก็บสถานะการ Calibrate ขอบเขตองศา (แยกมือซ้าย-ขวา และแยกรายนิ้ว)
+        self._calib = {
+            "Left":  {n: {"min": DEFAULT_MIN_ANGLE, "max": DEFAULT_MAX_ANGLE} for n in FINGER_NAMES},
+            "Right": {n: {"min": DEFAULT_MIN_ANGLE, "max": DEFAULT_MAX_ANGLE} for n in FINGER_NAMES},
+        }
+
+        print(f"[PD Mode] Initialized with Auto-Calibration. UDP -> {host}:{port}")
 
     def process(self, frame, results):
         """
-        Call every frame while MODE == "PD".
+        เรียกใช้ทุกเฟรมในขณะที่ MODE == "PD"
         """
         import cv2
 
         h_frame, w_frame, _ = frame.shape
 
-        # Group landmarks by Left/Right
+        # จัดกลุ่ม Landmark โดยแยกมือซ้าย/มือขวา
         hand_map = {}
-        if results.multi_hand_landmarks and results.multi_handedness:
+        if results and results.multi_hand_landmarks and results.multi_handedness:
             for hand_lm, handedness in zip(results.multi_hand_landmarks,
                                            results.multi_handedness):
                 label = handedness.classification[0].label
                 if _is_valid(hand_lm):
                     hand_map[label] = hand_lm
-                    # Draw skeleton on frame
+                    # วาดโครงกระดูกมือบนเฟรม
                     import mediapipe as mp
                     mp_draw = mp.solutions.drawing_utils
                     mp_draw.draw_landmarks(
@@ -138,33 +145,67 @@ class PDMode:
         left_data  = None
         right_data = None
 
-        for hand, hand_lm in hand_map.items():
-            raw         = _get_raw_values(hand_lm.landmark)
-            finger_data = self._smooth(raw, hand)
+        for hand in ["Left", "Right"]:
+            if hand in hand_map:
+                hand_lm = hand_map[hand]
+                
+                # 1. ดึงมุมจริง ณ เฟรมปัจจุบันของแต่ละนิ้ว
+                raw_angles = {name: _get_finger_angle(hand_lm.landmark, name) for name in FINGER_NAMES}
+                
+                # 2. Auto-Calibrate: อัปเดตช่วงขอบเขตสูงสุด-ต่ำสุดอย่างชาญฉลาด
+                for name in FINGER_NAMES:
+                    angle = raw_angles[name]
+                    # ถว่างอนิ้วได้ลึกกว่าค่าเดิมที่จำไว้ -> อัปเดตขยายขอบเขต min ลงไปอีก
+                    if angle < self._calib[hand][name]["min"]:
+                        self._calib[hand][name]["min"] = angle
+                    # ถ้ายืดนิ้วได้ตรงกว่าค่าเดิมที่จำไว้ -> อัปเดตขยายขอบเขต max ขึ้นไปอีก
+                    if angle > self._calib[hand][name]["max"]:
+                        self._calib[hand][name]["max"] = angle
 
-            offset_x = 10 if hand == "Left" else w_frame // 2 + 10
-            self._draw_hand_debug(frame, finger_data, hand, offset_x)
+                # 3. แปลงค่าองศาให้เป็นค่าสากล (0.0 = นิ้วเหยียดตรง, 1.0 = นิ้วงอสุด)
+                normalized = {}
+                for name in FINGER_NAMES:
+                    angle = raw_angles[name]
+                    min_a = self._calib[hand][name]["min"]
+                    max_a = self._calib[hand][name]["max"]
 
-            if hand == "Left":
-                left_data  = finger_data
-            else:
-                right_data = finger_data
+                    if max_a == min_a:
+                        curl = 0.0
+                    else:
+                        # ถ้ายิ่งใกล้มุมต่ำ (min_a) แสดงว่างอสุด (1.0) ถ้ายิ่งใกล้มุมสูง (max_a) แสดงว่ายืดสุด (0.0)
+                        curl = (max_a - angle) / (max_a - min_a)
+
+                    normalized[name] = float(np.clip(curl, 0.0, 1.0))
+
+                # 4. ใช้ EMA กรองความสมูทในการส่งค่าขยับนิ้ว
+                finger_data = self._smooth(normalized, hand)
+
+                offset_x = 10 if hand == "Left" else w_frame // 2 + 10
+                self._draw_hand_debug(frame, finger_data, hand, offset_x)
+
+                if hand == "Left":
+                    left_data  = finger_data
+                else:
+                    right_data = finger_data
 
         self._send(left_data, right_data)
         self._draw_status(frame, detected_hands)
         return "tracking"
 
     def reset_calibration(self):
-        """No calibration to reset, but keep method for main.py compatibility"""
-        # We can reset the smoothed values to 0
+        """ล้างประวัติการจำค่าความเรียบเนียนและการตั้งค่าคาลิเบรตนิ้วทั้งหมด"""
         self._prev = {
             "Left":  {n: 0.0 for n in FINGER_NAMES},
             "Right": {n: 0.0 for n in FINGER_NAMES},
         }
-        print("[PD Mode] Reset finger smoothing values.")
+        self._calib = {
+            "Left":  {n: {"min": DEFAULT_MIN_ANGLE, "max": DEFAULT_MAX_ANGLE} for n in FINGER_NAMES},
+            "Right": {n: {"min": DEFAULT_MIN_ANGLE, "max": DEFAULT_MAX_ANGLE} for n in FINGER_NAMES},
+        }
+        print("[PD Mode] Reset finger smoothing and auto-calibration limits.")
 
     def close(self):
-        """Close UDP socket"""
+        """ปิดการเชื่อมต่อ UDP socket"""
         try:
             self._sock.close()
         except Exception:
@@ -209,9 +250,14 @@ class PDMode:
             color  = DEBUG_COLORS[name]
             y      = 108 + i * 28
             label  = LIMB_LABELS[name]
+            
+            # ดึงช่วง Calibrated ปัจจุบันมาแสดงผลบนหน้าจอดีบัก
+            min_a  = self._calib[hand][name]["min"]
+            max_a  = self._calib[hand][name]["max"]
 
-            cv2.putText(frame, f"{name} {label}: {value:.2f}",
-                        (offset_x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1)
+            # แสดงช่วงองศาจริงที่จับได้ (เช่น 84-152 องศา) ข้างชื่อนิ้ว
+            cv2.putText(frame, f"{name} ({min_a:.0f}-{max_a:.0f}deg): {value:.2f}",
+                        (offset_x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
 
             bar_x, bar_w = offset_x, 130
             bar_y = y + 5

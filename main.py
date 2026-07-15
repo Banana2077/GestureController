@@ -12,7 +12,7 @@ import time
 # PD MODE (Finger-Curl Tracking)
 # ============================================
 from pd_mode import PDMode
-pd_mode_instance = PDMode()   # Initialize PD Mode (Finger-Curl Tracking, no calibration needed)
+pd_mode_instance = PDMode()   # Initialize PD Mode (Finger-Curl Tracking, auto calibration)
 
 # ============================================
 # LOAD MODEL
@@ -71,8 +71,6 @@ GESTURE_LABELS = {
     "bird": "bird",
     "cow": "cow",
     "deer": "deer",
-    
-
 }
 
 CONFIDENCE_THRESHOLD = 0.5
@@ -218,7 +216,7 @@ def unity_receiver(conn):
                 if cmd == "startminigame":
                     MODE = "PD"
                     HOLD_FRAMES = 0
-                    pd_mode_instance.reset_calibration() # Reset finger smoothing values
+                    pd_mode_instance.reset_calibration() # Reset finger smoothing and calibrate values
                     print("[MODE] -> PD  (startminigame from Unity)")
                 elif cmd == "stopminigame":
                     MODE = "CONTROL"
@@ -453,9 +451,15 @@ while True:
     right_state = "NONE"
 
     # ============================================
-    # DETECT HAND
+    # DETECT HAND & MODE ROUTING (แก้ไขตรงนี้ให้ทํางานเสถียร)
     # ============================================
-    if results.multi_hand_landmarks:
+    
+    # 1. ให้โหมด PD ทำงานเป็นอันดับแรกเสมอ เพื่อให้ตรวจจับและแสดง UI ได้ ตลอดเวลาแม้ว่ากล้องจะเจอมือหรือไม่ก็ตาม
+    if MODE == "PD":
+        pd_mode_instance.process(frame, results)
+
+    # 2. โหมดอื่นๆ (CONTROL, GESTURE) จะตรวจจับทำงานก็ต่อเมื่อกล้องเจอมือเท่านั้น
+    elif results.multi_hand_landmarks:
 
         all_open = len(results.multi_hand_landmarks) == 2 and all(
             is_open_hand(hl)
@@ -606,7 +610,7 @@ while True:
                     left_hand_detected = True
                     closed = states.count(0)
 
-                    # Apply Exponential Moving Average (EMA) to smooth hand coordinates
+                    # Apply Exponential Moving Average (EMA) to smooth left hand coordinates
                     if smoothed_cx is None:
                         smoothed_cx = cx
                         smoothed_cy = cy
@@ -853,14 +857,9 @@ while True:
 
                 print("[MODE] -> CONTROL")
 
-        # ============================================
-        # PD MODE (Finger-Curl Tracking -> Unity)
-        # ============================================
-        elif MODE == "PD":
-            pd_mode_instance.process(frame, results)
 
     # ============================================
-    # NO HAND
+    # NO HAND (ทำงานเฉพาะในโหมด CONTROL หรือ GESTURE เท่านั้นเมื่อไม่มีมือ)
     # ============================================
     else:
 
@@ -977,7 +976,7 @@ while True:
     if key == ord("q"):
         break
     elif key == ord("r") and MODE == "PD":
-        pd_mode_instance.reset_calibration() # Reset finger smoothing values
+        pd_mode_instance.reset_calibration() # Reset finger smoothing and calibration values
 
 # ============================================
 # CLEANUP
