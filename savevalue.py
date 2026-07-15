@@ -46,7 +46,7 @@ BACKGROUND_TYPE = "color"  # Change this to "color", "image", or "blur"
 BG_COLOR = (0, 0, 0)  # background color in BGR format
 
 # Webcam Initialization (try camera index 1 first, fallback to 0 if it fails)
-cap = cv2.VideoCapture(1)
+cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     print("Warning: Camera index 1 could not be opened. Falling back to camera index 0.")
     cap = cv2.VideoCapture(0)

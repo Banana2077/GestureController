@@ -9,6 +9,12 @@ import math
 import time
 
 # ============================================
+# PD MODE (Finger-Curl Tracking)
+# ============================================
+from pd_mode import PDMode
+pd_mode_instance = PDMode()   # Initialize PD Mode (Finger-Curl Tracking, no calibration needed)
+
+# ============================================
 # LOAD MODEL
 # ============================================
 import os
@@ -74,6 +80,7 @@ CONFIDENCE_THRESHOLD = 0.5
 # ============================================
 # MODE
 # ============================================
+# Modes: "CONTROL", "GESTURE", "PD"
 MODE = "CONTROL"
 
 # ============================================
@@ -181,6 +188,48 @@ yolo_thread.start()
 last_tcp_message = ""
 
 # ============================================
+# UNITY -> PYTHON RECEIVE
+# ============================================
+# Timestamp after which GESTURE mode is allowed again (0 = always allowed)
+gesture_cooldown_until = 0.0
+GESTURE_COOLDOWN_SECS = 3.0
+
+def unity_receiver(conn):
+    """
+    Background thread: reads newline-delimited commands sent BY Unity.
+    Supported commands:
+        startminigame  ->  switch to PD mode
+        stopminigame   ->  switch to CONTROL + block GESTURE for 3s
+    """
+    global MODE, HOLD_FRAMES, gesture_cooldown_until
+    buf = b""
+    try:
+        while running:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                cmd = line.decode("utf-8", errors="ignore").strip()
+                if not cmd:
+                    continue
+                print(f"[TCP RECV] Unity said: '{cmd}'")
+                if cmd == "startminigame":
+                    MODE = "PD"
+                    HOLD_FRAMES = 0
+                    pd_mode_instance.reset_calibration() # Reset finger smoothing values
+                    print("[MODE] -> PD  (startminigame from Unity)")
+                elif cmd == "stopminigame":
+                    MODE = "CONTROL"
+                    HOLD_FRAMES = 0
+                    gesture_cooldown_until = time.time() + GESTURE_COOLDOWN_SECS
+                    joystick_active = False
+                    print(f"[MODE] -> CONTROL  (stopminigame from Unity, GESTURE locked {GESTURE_COOLDOWN_SECS}s)")
+    except Exception as e:
+        print(f"[TCP RECV ERROR] {e}")
+
+# ============================================
 # TCP SERVER
 # ============================================
 def socket_server():
@@ -204,6 +253,12 @@ def socket_server():
                 client_conn = conn
 
             print(f"[TCP] Unity connected: {addr}")
+
+            # Start a receiver thread for this connection
+            recv_thread = threading.Thread(
+                target=unity_receiver, args=(conn,), daemon=True
+            )
+            recv_thread.start()
 
         except Exception as e:
             print("[TCP SERVER ERROR]", e)
@@ -446,34 +501,44 @@ while True:
 
             if HOLD_FRAMES >= HOLD_REQUIRED:
 
-                MODE = "GESTURE"
+                # Check 3-second cooldown after stopminigame
+                if time.time() < gesture_cooldown_until:
+                    remaining_cd = gesture_cooldown_until - time.time()
+                    cv2.putText(frame,
+                                f"Gesture locked ({remaining_cd:.1f}s)",
+                                (10, h - 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 80, 200), 2)
+                    HOLD_FRAMES = 0
 
-                HOLD_FRAMES = 0
+                else:
+                    MODE = "GESTURE"
 
-                gesture_text = ""
+                    HOLD_FRAMES = 0
 
-                final_gesture = "dont"
+                    gesture_text = ""
 
-                with yolo_lock:
-                    gesture_votes = {}
-                    yolo_result = ("Not sure...", 0.0, None)
-                    # Clear queue from any leftover frames
-                    try:
-                        while not yolo_queue.empty():
-                            yolo_queue.get_nowait()
-                            yolo_queue.task_done()
-                    except queue.Empty:
-                        pass
+                    final_gesture = "dont"
 
-                gesture_frame_count = 0
+                    with yolo_lock:
+                        gesture_votes = {}
+                        yolo_result = ("Not sure...", 0.0, None)
+                        # Clear queue from any leftover frames
+                        try:
+                            while not yolo_queue.empty():
+                                yolo_queue.get_nowait()
+                                yolo_queue.task_done()
+                        except queue.Empty:
+                            pass
 
-                gesture_start_time = time.time()
+                    gesture_frame_count = 0
 
-                joystick_active = False
+                    gesture_start_time = time.time()
 
-                send_tcp("gesture")
+                    joystick_active = False
 
-                print("[MODE] → GESTURE")
+                    send_tcp("gesture")
+
+                    print("[MODE] -> GESTURE")
 
         elif MODE == "CONTROL":
             HOLD_FRAMES = 0
@@ -786,7 +851,13 @@ while True:
 
                 joystick_active = False
 
-                print("[MODE] → CONTROL")
+                print("[MODE] -> CONTROL")
+
+        # ============================================
+        # PD MODE (Finger-Curl Tracking -> Unity)
+        # ============================================
+        elif MODE == "PD":
+            pd_mode_instance.process(frame, results)
 
     # ============================================
     # NO HAND
@@ -826,6 +897,18 @@ while True:
             2
         )
 
+    elif MODE == "PD":
+
+        cv2.putText(
+            frame,
+            "[PD] Finger-Curl -> Unity UDP :5052",
+            (10, 42),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (200, 100, 255),
+            2
+        )
+
     else:
 
         cv2.putText(
@@ -839,8 +922,8 @@ while True:
         )
 
     mode_color = (
-        (0, 200, 255)
-        if MODE == "CONTROL"
+        (0, 200, 255) if MODE == "CONTROL"
+        else (200, 100, 255) if MODE == "PD"
         else (0, 255, 100)
     )
 
@@ -893,6 +976,8 @@ while True:
 
     if key == ord("q"):
         break
+    elif key == ord("r") and MODE == "PD":
+        pd_mode_instance.reset_calibration() # Reset finger smoothing values
 
 # ============================================
 # CLEANUP
@@ -913,6 +998,8 @@ except:
     pass
 
 udp_sock.close()
+
+pd_mode_instance.close()
 
 cap.release()
 
