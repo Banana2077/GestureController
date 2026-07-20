@@ -439,6 +439,9 @@ while True:
 
     frame = cv2.flip(frame, 1)
 
+    # Copy เฟรมที่สะอาด (ไม่มีการวาด Landmark) สำหรับนำไป Crop และทำ Thresholding เงามือโดยเฉพาะ
+    clean_frame = frame.copy()
+
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     results = hands.process(rgb)
@@ -448,6 +451,34 @@ while True:
     # Initialize a black silhouette frame for GESTURE mode
     import numpy as np
     silhouette_frame = np.zeros_like(frame)
+
+    # =========================================================================
+    # [ADD] THRESHOLD PREVIEW WINDOW INITIALIZATION
+    # สร้างภาพพื้นหลังดำสำหรับแสดงหน้าต่างตรวจดูค่า Threshold และภาพเงามือแบบเรียลไทม์
+    # =========================================================================
+    thresh_preview_img = np.zeros((320, 320, 3), dtype=np.uint8)
+    if MODE == "GESTURE":
+        cv2.putText(
+            thresh_preview_img,
+            "Waiting for hand...",
+            (40, 160),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+    else:
+        cv2.putText(
+            thresh_preview_img,
+            "GESTURE Mode Inactive",
+            (30, 160),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
 
     left_state = "Idle"
     right_state = "NONE"
@@ -696,6 +727,9 @@ while True:
             gesture_frame_count += 1
             yolo_input = None
 
+            # ป้องกัน UnboundLocalError ในกรณีที่ตรวจไม่พบกลุ่มมือในเฟรมปัจจุบัน
+            x_min, x_max, y_min, y_max = 0, 0, 0, 0
+
             # Group close hands
             hand_groups = group_hands(results.multi_hand_landmarks, w, h)
 
@@ -736,12 +770,21 @@ while True:
                 y_min, y_max = max(y_min, 0), min(y_max, h)
 
                 if x_max > x_min and y_max > y_min:
-                    # Crop directly from frame without selfie segmentation
-                    hand_roi = frame[y_min:y_max, x_min:x_max]
+                    # Crop จาก clean_frame (เฟรมสะอาดที่ยังไม่ได้วาดสัญลักษณ์หรือจุด Landmark) เพื่อหลีกเลี่ยงการมีเส้น Landmark ไปปรากฏในภาพเงามือ
+                    hand_roi = clean_frame[y_min:y_max, x_min:x_max]
 
                     if hand_roi.size > 0:
+                        # แปลงภาพเป็น Gray scale
                         gray = cv2.cvtColor(hand_roi, cv2.COLOR_BGR2GRAY)
-                        _, mask = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
+                        # ใช้ Otsu's Thresholding คำนวณค่าขีดจำกัดอัตโนมัติ (otsu_thresh) และรับภาพ mask ขาวดำ
+                        otsu_thresh, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+                        # =========================================================================
+                        # [ADD] Morphological Operations (ลบสัญญาณรบกวนภายนอก และเติมรูโหว่กลางอุ้งมือให้ทึบเต็มแผ่น)
+                        # =========================================================================
+                        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel) # เชื่อมรูโหว่ในมือให้ทึบสมบูรณ์
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)  # ลบจุดฝุ่นรบกวนด้านนอกมือ
 
                         hand_canvas = np.zeros_like(hand_roi)
                         hand_canvas[:] = (255, 255, 255)
@@ -753,6 +796,22 @@ while True:
                         crop_h = y_max - y_min
                         
                         yolo_input = (crop_img.copy(), x_min, y_min, crop_w, crop_h)
+
+                        # =========================================================================
+                        # [ADD] UPDATE THRESHOLD PREVIEW
+                        # นำภาพเงามือขาวดำที่ผ่านการ Threshold มาย่อขนาด และวาดข้อความแสดงค่า Otsu Threshold ลงบนรูปภาพ
+                        # =========================================================================
+                        thresh_preview_img = cv2.resize(hand_result, (320, 320), interpolation=cv2.INTER_NEAREST)
+                        cv2.putText(
+                            thresh_preview_img,
+                            f"Otsu Thresh: {int(otsu_thresh)}",
+                            (15, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 255, 0),
+                            2,
+                            cv2.LINE_AA
+                        )
 
                 # Draw bounding box on visual feedback per group
                 cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
@@ -769,13 +828,42 @@ while True:
                 pred_gesture, conf, best_box = yolo_result
 
             if conf > 0:
-                gesture_text = f"rabbit ({conf:.0%})"
+                gesture_text = f"{final_gesture} ({conf:.0%})"
                 # Draw YOLO detection on visual feedback frame
                 if best_box is not None:
                     x1s, y1s, x2s, y2s = best_box
                     cv2.rectangle(frame, (x1s, y1s), (x2s, y2s), (0, 255, 255), 2)
                     cv2.putText(frame, gesture_text, (x1s, y1s - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                    # =========================================================================
+                    # [ADD] DRAW YOLO PREDICTION ON THRESHOLD PREVIEW WINDOW
+                    # แปลงพิกัดแบบเต็มเฟรมกลับมาเป็นระบบพิกัด 320x320 ของหน้าต่างย่อย เพื่อตรวจจับเงาโดยละเอียด
+                    # =========================================================================
+                    crop_w = x_max - x_min
+                    crop_h = y_max - y_min
+                    if crop_w > 0 and crop_h > 0:
+                        px1 = int(((x1s - x_min) / crop_w) * 320)
+                        py1 = int(((y1s - y_min) / crop_h) * 320)
+                        px2 = int(((x2s - x_min) / crop_w) * 320)
+                        py2 = int(((y2s - y_min) / crop_h) * 320)
+                        
+                        # ควบคุมไม่ให้พิกัดทะลุขอบขนาดภาพ 320x320
+                        px1, px2 = max(0, min(px1, 320)), max(0, min(px2, 320))
+                        py1, py2 = max(0, min(py1, 320)), max(0, min(py2, 320))
+                        
+                        # วาดกล่องข้อความและกรอบการทายผลสีฟ้าลงในหน้าต่าง Preview ย่อย
+                        cv2.rectangle(thresh_preview_img, (px1, py1), (px2, py2), (0, 255, 255), 2)
+                        cv2.putText(
+                            thresh_preview_img, 
+                            f"{pred_gesture} ({conf:.0%})", 
+                            (px1, py1 - 8 if py1 - 8 > 15 else py1 + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 
+                            0.55, 
+                            (0, 255, 255), 
+                            1, 
+                            cv2.LINE_AA
+                        )
             else:
                 gesture_text = "Not sure..."
 
@@ -829,12 +917,12 @@ while True:
 
                         send_tcp(
                             "",
-                            gesture="rabbit"
+                            gesture=final_gesture
                         )
 
                         print(
-                            #f"[GESTURE] FINAL: {final_gesture}"
-                            f"[GESTURE] FINAL: rabbit"
+                            f"[GESTURE] FINAL: {final_gesture}"
+                            #f"[GESTURE] FINAL: rabbit"
                         )
 
                     else:
@@ -971,6 +1059,15 @@ while True:
     cv2.imshow(
         "Hand Controller + Gesture",
         frame
+    )
+
+    # =========================================================================
+    # [ADD] SHOW THRESHOLD PREVIEW WINDOW
+    # แสดงหน้าต่างตรวจดูค่า Threshold และภาพเงามือแบบเรียลไทม์
+    # =========================================================================
+    cv2.imshow(
+        "Threshold Viewer",
+        thresh_preview_img
     )
 
     key = cv2.waitKey(1) & 0xFF
