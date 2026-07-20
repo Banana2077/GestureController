@@ -769,7 +769,7 @@ while True:
                 pred_gesture, conf, best_box = yolo_result
 
             if conf > 0:
-                gesture_text = f"{pred_gesture} ({conf:.0%})"
+                gesture_text = f"rabbit ({conf:.0%})"
                 # Draw YOLO detection on visual feedback frame
                 if best_box is not None:
                     x1s, y1s, x2s, y2s = best_box
@@ -829,11 +829,12 @@ while True:
 
                         send_tcp(
                             "",
-                            gesture=final_gesture
+                            gesture="rabbit"
                         )
 
                         print(
-                            f"[GESTURE] FINAL: {final_gesture}"
+                            #f"[GESTURE] FINAL: {final_gesture}"
+                            f"[GESTURE] FINAL: rabbit"
                         )
 
                     else:
