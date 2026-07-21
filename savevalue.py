@@ -184,13 +184,35 @@ while True:
                     hand_roi = output_frame[y_min:y_max, x_min:x_max]
                     
                     if hand_roi.size > 0:
+                        # แปลงภาพเป็น Gray scale
                         gray = cv2.cvtColor(hand_roi, cv2.COLOR_BGR2GRAY)
-                        _, mask = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY_INV)
+                        
+                        # ใช้ Otsu's Thresholding หาค่าอัตโนมัติแบบเดียวกับ main.py
+                        otsu_thresh, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+                        # =========================================================================
+                        # Morphological Operations (ลบสัญญาณรบกวนภายนอก และเติมรูโหว่กลางอุ้งมือให้ทึบเต็มแผ่น)
+                        # =========================================================================
+                        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel) # เชื่อมรูโหว่ในมือให้ทึบสมบูรณ์
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)  # ลบจุดฝุ่นรบกวนด้านนอกมือ
 
                         hand_canvas = np.zeros_like(hand_roi)
                         hand_canvas[:] = (255, 255, 255)
                         mask_3ch = cv2.merge([mask, mask, mask])
                         hand_result = np.where(mask_3ch == 255, hand_canvas, 0)
+
+                        # แสดงค่า Otsu Threshold บนเฟรมตรวจสอบ
+                        cv2.putText(
+                            output,
+                            f"Otsu: {int(otsu_thresh)}",
+                            (x_min + 5, y_min + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 255, 0),
+                            1,
+                            cv2.LINE_AA
+                        )
 
                         # Apply filters to hand only
                         hand_filtered = apply_filters(hand_result, 50, 50, 50, 50)
