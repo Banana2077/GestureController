@@ -839,10 +839,10 @@ while True:
                 pred_gesture, conf, best_box = yolo_result
 
             if conf > 0:
-                #last_detected_animal = pred_gesture
-                last_detected_animal = "rabbit"  # Force to "rabbit" for testing
-                #gesture_text = f"{pred_gesture} ({conf:.0%})"
-                gesture_text = f"rabbit ({conf:.0%})"
+                last_detected_animal = pred_gesture
+                #last_detected_animal = "rabbit"  # Force to "rabbit" for testing
+                gesture_text = f"{pred_gesture} ({conf:.0%})"
+                #gesture_text = f"rabbit ({conf:.0%})"
                 # Draw YOLO detection on visual feedback frame
                 if best_box is not None:
                     x1s, y1s, x2s, y2s = best_box
@@ -880,8 +880,8 @@ while True:
                         )
             else:
                 if last_detected_animal is not None:
-                    #gesture_text = f"{last_detected_animal}"
-                    gesture_text = f"rabbit"
+                    gesture_text = f"{last_detected_animal}"
+                    #gesture_text = f"rabbit"
                 else:
                     gesture_text = "Not sure..."
 
