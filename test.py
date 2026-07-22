@@ -90,6 +90,7 @@ GESTURE_DURATION = 0.75
 gesture_start_time = 0
 
 gesture_votes = {}
+last_detected_animal = None
 
 # ============================================
 # JOYSTICK
@@ -355,6 +356,7 @@ while True:
                 final_gesture = "dont"
 
                 gesture_votes = {}
+                last_detected_animal = None
 
                 gesture_start_time = time.time()
 
@@ -570,7 +572,6 @@ while True:
                 )
 
             # Run YOLO model prediction on the silhouette canvas
-            gesture_text = "Not sure..."
             if model is not None:
                 yolo_results = model(silhouette_frame, verbose=False)
                 best_conf = 0.0
@@ -590,6 +591,7 @@ while True:
                 if best_conf >= CONFIDENCE_THRESHOLD and best_pred is not None:
                     # Map the predicted YOLO class name to the Unity gesture name
                     pred_gesture = YOLO_GESTURE_MAPPING.get(best_pred, best_pred)
+                    last_detected_animal = pred_gesture
                     gesture_text = f"{pred_gesture} ({best_conf:.0%})"
                     
                     # Store vote
@@ -601,6 +603,11 @@ while True:
                         cv2.rectangle(frame, (x1s, y1s), (x2s, y2s), (0, 255, 255), 2)
                         cv2.putText(frame, gesture_text, (x1s, y1s - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                else:
+                    if last_detected_animal is not None:
+                        gesture_text = f"{last_detected_animal} (Last detected)"
+                    else:
+                        gesture_text = "Not sure..."
 
             # ============================================
             # COUNTDOWN BAR

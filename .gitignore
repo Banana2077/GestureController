@@ -210,3 +210,10 @@ __marimo__/
 .labels
 images/
 labels/
+
+.images_old
+.labels_old
+images_old/
+labels-old/
+
+

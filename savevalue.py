@@ -25,6 +25,17 @@ save_crop = False  # Set to True only when you want to save
 frame_id = 0  # Increment this after each save
 detect = False # use for check it use detection
 
+YOLO_GESTURE_MAPPING = {
+    "class_0": "rabbit",
+    "class_1": "dog",
+    "class_2": "bird",
+    "class_3": "cow",
+    "class_4": "deer",
+}
+
+last_detected_animal = None
+gesture_text = "Not sure..."
+
 # YOLO PoseDetection Model Paths
 model_path = "C:/Users/comsc/best_project/GestureController/best.pt"
 
@@ -184,11 +195,19 @@ while True:
                     hand_roi = output_frame[y_min:y_max, x_min:x_max]
                     
                     if hand_roi.size > 0:
-                        # แปลงภาพเป็น Gray scale
-                        gray = cv2.cvtColor(hand_roi, cv2.COLOR_BGR2GRAY)
+                        # แปลงภาพจาก BGR เป็น HSV เพื่อทำ Skin-Color Detection
+                        hsv = cv2.cvtColor(hand_roi, cv2.COLOR_BGR2HSV)
                         
-                        # ใช้ Otsu's Thresholding หาค่าอัตโนมัติแบบเดียวกับ main.py
-                        otsu_thresh, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                        # กำหนดช่วงสีผิวคนในโมเดล HSV (ครอบคลุมผิวหนังของมนุษย์ทุกเฉดสี)
+                        lower_skin1 = np.array([0, 20, 40], dtype=np.uint8)
+                        upper_skin1 = np.array([20, 160, 255], dtype=np.uint8)
+                        lower_skin2 = np.array([160, 20, 40], dtype=np.uint8)
+                        upper_skin2 = np.array([180, 160, 255], dtype=np.uint8)
+                        
+                        mask1 = cv2.inRange(hsv, lower_skin1, upper_skin1)
+                        mask2 = cv2.inRange(hsv, lower_skin2, upper_skin2)
+                        mask = cv2.bitwise_or(mask1, mask2)
+                        otsu_thresh = 0  # กำหนดเป็น 0 เนื่องจากใช้โหมดสี HSV แทน Grayscale
 
                         # =========================================================================
                         # Morphological Operations (ลบสัญญาณรบกวนภายนอก และเติมรูโหว่กลางอุ้งมือให้ทึบเต็มแผ่น)
@@ -202,10 +221,10 @@ while True:
                         mask_3ch = cv2.merge([mask, mask, mask])
                         hand_result = np.where(mask_3ch == 255, hand_canvas, 0)
 
-                        # แสดงค่า Otsu Threshold บนเฟรมตรวจสอบ
+                        # แสดงสถานะสีผิวบนเฟรมตรวจสอบ
                         cv2.putText(
                             output,
-                            f"Otsu: {int(otsu_thresh)}",
+                            "HSV Skin",
                             (x_min + 5, y_min + 20),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
@@ -253,24 +272,42 @@ while True:
                                 results_shadow = model_shadow(save_img, verbose=False)
                                 crop_w = x_max - x_min
                                 crop_h = y_max - y_min
+                                best_conf = 0.0
+                                best_pred = None
+                                best_box = None
+                                
                                 for shadow_result in results_shadow:
                                     shadow_boxes = shadow_result.boxes
                                     if shadow_boxes is not None:
                                         for shadow_box in shadow_boxes:
-                                            nx1, ny1, nx2, ny2 = map(float, shadow_box.xyxyn[0].tolist())
-                                            # Map back to full frame
-                                            x1s = int(x_min + nx1 * crop_w)
-                                            y1s = int(y_min + ny1 * crop_h)
-                                            x2s = int(x_min + nx2 * crop_w)
-                                            y2s = int(y_min + ny2 * crop_h)
                                             conf_s = float(shadow_box.conf[0])
-                                            cls_s = int(shadow_box.cls[0])
-                                            
-                                            # Draw predicted bounding box
-                                            cv2.rectangle(output, (x1s, y1s), (x2s, y2s), (0, 255, 0), 2)
-                                            label_text = f"{model_shadow.names[cls_s]} {conf_s:.2f}"
-                                            cv2.putText(output, label_text, (x1s, y1s - 10), 
-                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                            if conf_s > best_conf:
+                                                best_conf = conf_s
+                                                cls_s = int(shadow_box.cls[0])
+                                                best_pred = shadow_result.names[cls_s]
+                                                best_box = list(map(float, shadow_box.xyxyn[0].tolist()))
+                                
+                                if best_conf >= 0.5 and best_pred is not None:
+                                    pred_gesture = YOLO_GESTURE_MAPPING.get(best_pred, best_pred)
+                                    last_detected_animal = pred_gesture
+                                    gesture_text = f"{pred_gesture} ({best_conf:.0%})"
+                                    
+                                    if best_box is not None:
+                                        nx1, ny1, nx2, ny2 = best_box
+                                        x1s = int(x_min + nx1 * crop_w)
+                                        y1s = int(y_min + ny1 * crop_h)
+                                        x2s = int(x_min + nx2 * crop_w)
+                                        y2s = int(y_min + ny2 * crop_h)
+                                        
+                                        # Draw predicted bounding box
+                                        cv2.rectangle(output, (x1s, y1s), (x2s, y2s), (0, 255, 0), 2)
+                                        cv2.putText(output, gesture_text, (x1s, y1s - 10), 
+                                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                else:
+                                    if last_detected_animal is not None:
+                                        gesture_text = f"{last_detected_animal} (Last detected)"
+                                    else:
+                                        gesture_text = "Not sure..."
                             except Exception as e:
                                 print(f"Shadow detection error: {e}")
 
@@ -287,6 +324,10 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     cv2.putText(original, f'Detect Mode: {"ON" if detect else "OFF"}', (30, 130), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0) if detect else (100, 100, 100), 2)
+
+    if detect:
+        cv2.putText(output, f"Prediction: {gesture_text}", (15, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 100), 2)
 
     cv2.imshow("Original", original)
     cv2.imshow('Webcam Background Removal', output_frame)
@@ -305,6 +346,8 @@ while True:
             print("Cannot enable detection: YOLO model was not loaded successfully.")
         else:
             detect = not detect
+            last_detected_animal = None
+            gesture_text = "Not sure..."
             print(f"Detection mode: {'ON' if detect else 'OFF'}")
     elif key == ord('q'):  # Quit
         break

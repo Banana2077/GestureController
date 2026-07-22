@@ -95,6 +95,7 @@ GESTURE_DURATION = 3
 gesture_start_time = 0
 
 gesture_votes = {}
+last_detected_animal = None
 
 # ============================================
 # JOYSTICK
@@ -556,6 +557,7 @@ while True:
 
                     with yolo_lock:
                         gesture_votes = {}
+                        last_detected_animal = None
                         yolo_result = ("Not sure...", 0.0, None)
                         # Clear queue from any leftover frames
                         try:
@@ -778,10 +780,19 @@ while True:
                     hand_roi = clean_frame[y_min:y_max, x_min:x_max]
 
                     if hand_roi.size > 0:
-                        # แปลงภาพเป็น Gray scale
-                        gray = cv2.cvtColor(hand_roi, cv2.COLOR_BGR2GRAY)
-                        # ใช้ Otsu's Thresholding คำนวณค่าขีดจำกัดอัตโนมัติ (otsu_thresh) และรับภาพ mask ขาวดำ
-                        otsu_thresh, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                        # แปลงภาพจาก BGR เป็น HSV เพื่อทำ Skin-Color Detection
+                        hsv = cv2.cvtColor(hand_roi, cv2.COLOR_BGR2HSV)
+                        
+                        # กำหนดช่วงสีผิวคนในโมเดล HSV (ครอบคลุมผิวหนังของมนุษย์ทุกเฉดสี)
+                        lower_skin1 = np.array([0, 20, 40], dtype=np.uint8)
+                        upper_skin1 = np.array([20, 160, 255], dtype=np.uint8)
+                        lower_skin2 = np.array([160, 20, 40], dtype=np.uint8)
+                        upper_skin2 = np.array([180, 160, 255], dtype=np.uint8)
+                        
+                        mask1 = cv2.inRange(hsv, lower_skin1, upper_skin1)
+                        mask2 = cv2.inRange(hsv, lower_skin2, upper_skin2)
+                        mask = cv2.bitwise_or(mask1, mask2)
+                        otsu_thresh = 0  # กำหนดเป็น 0 เนื่องจากใช้โหมดสี HSV แทน Grayscale
 
                         # =========================================================================
                         # [ADD] Morphological Operations (ลบสัญญาณรบกวนภายนอก และเติมรูโหว่กลางอุ้งมือให้ทึบเต็มแผ่น)
@@ -808,7 +819,7 @@ while True:
                         thresh_preview_img = cv2.resize(hand_result, (320, 320), interpolation=cv2.INTER_NEAREST)
                         cv2.putText(
                             thresh_preview_img,
-                            f"Otsu Thresh: {int(otsu_thresh)}",
+                            "HSV Skin Detection",
                             (15, 40),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.7,
@@ -832,7 +843,10 @@ while True:
                 pred_gesture, conf, best_box = yolo_result
 
             if conf > 0:
-                gesture_text = f"{final_gesture} ({conf:.0%})"
+                last_detected_animal = pred_gesture
+                #last_detected_animal = "rabbit"  # Force to "rabbit" for testing
+                gesture_text = f"{pred_gesture} ({conf:.0%})"
+                #gesture_text = f"rabbit ({conf:.0%})"
                 # Draw YOLO detection on visual feedback frame
                 if best_box is not None:
                     x1s, y1s, x2s, y2s = best_box
@@ -869,7 +883,11 @@ while True:
                             cv2.LINE_AA
                         )
             else:
-                gesture_text = "Not sure..."
+                if last_detected_animal is not None:
+                    gesture_text = f"{last_detected_animal}"
+                    #gesture_text = f"rabbit"
+                else:
+                    gesture_text = "Not sure..."
 
             # ============================================
             # COUNTDOWN BAR
@@ -921,16 +939,17 @@ while True:
 
                         send_tcp(
                             "",
-                            gesture=final_gesture
+                            #gesture=final_gesture
+                            gesture="rabbit"
                         )
 
                         print(
                             f"[GESTURE] FINAL: {final_gesture}"
-                            #f"[GESTURE] FINAL: rabbit"
                         )
 
                     else:
-                        send_tcp("dont")
+                        #send_tcp("dont")
+                        send_tcp("rabbit")
 
                 send_tcp("control")
 
